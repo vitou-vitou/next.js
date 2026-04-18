@@ -1,0 +1,11 @@
+Terminal 1 (Next.js):
+
+
+npm run dev:next
+
+
+Terminal 2 (Inngest):
+
+npm run dev:inngest
+
+
