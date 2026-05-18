@@ -168,6 +168,7 @@ import {
   DynamicHoleKind,
   trackThrownErrorInNavigation,
   createInstantValidationState,
+  type NavigationValidationResult,
 } from './dynamic-rendering'
 import { logBuildDebugHint } from './blocking-route-messages'
 import {
@@ -1468,7 +1469,9 @@ async function generateDynamicFlightRenderResultWithStagesInDev(
     isBuildTimePrerendering = false,
   } = renderOpts
 
+  let didErrorObservably = false
   function onFlightDataRenderError(err: DigestedError, silenceLog: boolean) {
+    didErrorObservably = true
     return onInstrumentationRequestError?.(
       err,
       req,
@@ -1578,7 +1581,8 @@ async function generateDynamicFlightRenderResultWithStagesInDev(
         ctx,
         finalRequestStore,
         fallbackParams,
-        validationDebugChannelClient
+        validationDebugChannelClient,
+        didErrorObservably
       )
     } else {
       logValidationSkipped(ctx)
@@ -1592,11 +1596,17 @@ async function generateDynamicFlightRenderResultWithStagesInDev(
       // for the full stream to finish accumulating so we also catch errors from
       // the dynamic stage.
       void accumulatedChunksPromise.then(() => {
-        if (workStore.invalidDynamicUsageError) {
-          logMessagesAndSendErrorsToBrowser(
-            [workStore.invalidDynamicUsageError],
-            ctx
-          )
+        const { invalidDynamicUsageError } = workStore
+        // Forward only if userland caught the rejection. If userland didn't
+        // catch, the rejection propagated into the React render and React's
+        // `serverComponentsErrorHandler` already stamped a digest on the error
+        // and emitted it as a Flight error chunk — surfacing it again here
+        // would duplicate the entry in the dev overlay.
+        if (
+          invalidDynamicUsageError &&
+          !(invalidDynamicUsageError as { digest?: unknown }).digest
+        ) {
+          logMessagesAndSendErrorsToBrowser([invalidDynamicUsageError], ctx)
         }
       })
     }
@@ -3060,11 +3070,27 @@ async function renderToHTMLOrFlightImpl(
       fallbackParams
     )
 
-    // Invalid dynamic usages should only error the request in development.
-    // In production, it's better to produce a result.
-    // (the dynamic error will still be thrown inside the component tree, but it's catchable by error boundaries)
-    if (workStore.invalidDynamicUsageError && process.env.__NEXT_DEV_SERVER) {
-      throw workStore.invalidDynamicUsageError
+    // Forward an invalid-dynamic-usage error recorded by `'use cache'` only
+    // when userland caught it (try/catch around the cache call). If userland
+    // didn't catch, the rejection propagated into the React render, and React's
+    // `serverComponentsErrorHandler` already stamped a digest on the error and
+    // emitted it as a Flight error chunk — surfacing it again here would
+    // duplicate the entry in the dev overlay.
+    //
+    // The cacheComponents paths forward this themselves via
+    // `spawnStaticShellValidationInDev` and the validation-skipped fallback in
+    // `generateDynamicFlightRenderResultWithStagesInDev`. Here we cover the
+    // non-cacheComponents dev path where neither runs.
+    if (
+      process.env.__NEXT_DEV_SERVER &&
+      !cacheComponents &&
+      workStore.invalidDynamicUsageError &&
+      !(workStore.invalidDynamicUsageError as { digest?: unknown }).digest
+    ) {
+      void logMessagesAndSendErrorsToBrowser(
+        [workStore.invalidDynamicUsageError],
+        ctx
+      )
     }
 
     // If we have pending revalidates, wait until they are all resolved.
@@ -3378,7 +3404,11 @@ async function renderToStream(
   return getTracer().withSpan(renderSpan, async () => {
     // MARK: renderToStream errorHandlers
     const { reactServerErrorsByDigest } = workStore
+
+    // We use this to determine if we should suppress other derivative errors
+    let didErrorObservably = false
     function onHTMLRenderRSCError(err: DigestedError, silenceLog: boolean) {
+      didErrorObservably = true
       return onInstrumentationRequestError?.(
         err,
         req,
@@ -3510,7 +3540,8 @@ async function renderToStream(
               ctx,
               finalRequestStore,
               fallbackParams,
-              validationDebugChannelClient
+              validationDebugChannelClient,
+              didErrorObservably
             )
 
             reactServerResult = new ReactServerResult(serverStream)
@@ -3629,7 +3660,8 @@ async function renderToStream(
               ctx,
               finalRequestStore,
               fallbackParams,
-              validationDebugChannelClient
+              validationDebugChannelClient,
+              didErrorObservably
             )
 
             reactServerResult = new ReactServerResult(serverStream)
@@ -3693,6 +3725,12 @@ async function renderToStream(
 
           requestStore.stale = INFINITE_CACHE
           requestStore.stagedRendering = stageController
+          requestStore.asyncApiPromises = createAsyncApiPromises(
+            stageController,
+            requestStore.cookies,
+            requestStore.mutableCookies,
+            requestStore.headers
+          )
           requestStore.varyParamsAccumulator =
             createResponseVaryParamsAccumulator()
 
@@ -3822,6 +3860,12 @@ async function renderToStream(
 
           requestStore.stale = INFINITE_CACHE
           requestStore.stagedRendering = stageController
+          requestStore.asyncApiPromises = createAsyncApiPromises(
+            stageController,
+            requestStore.cookies,
+            requestStore.mutableCookies,
+            requestStore.headers
+          )
           requestStore.varyParamsAccumulator =
             createResponseVaryParamsAccumulator()
 
@@ -5569,7 +5613,8 @@ async function spawnStaticShellValidationInDevImpl(
   ctx: AppRenderContext,
   requestStore: RequestStore,
   fallbackRouteParams: OpaqueFallbackRouteParams | null,
-  debugChannelClient: AnyStream | undefined
+  debugChannelClient: AnyStream | undefined,
+  devRenderDidError: boolean
 ): Promise<void> {
   const debug =
     process.env.NEXT_PRIVATE_DEBUG_VALIDATION === '1' ? console.log : undefined
@@ -5591,11 +5636,19 @@ async function spawnStaticShellValidationInDevImpl(
 
   const hmrRefreshHash = getHmrRefreshHash(requestStore)
 
-  // We don't need to continue the prerender process if we already
-  // detected invalid dynamic usage in the initial prerender phase.
   const { invalidDynamicUsageError } = workStore
   if (invalidDynamicUsageError) {
-    return logMessagesAndSendErrorsToBrowser([invalidDynamicUsageError], ctx)
+    // We don't need to continue the prerender process if we already detected
+    // invalid dynamic usage in the initial prerender phase. Forward the error
+    // to the dev overlay only when userland caught the rejection. If userland
+    // didn't catch, the rejection propagated into the React render and React's
+    // `serverComponentsErrorHandler` already stamped a digest on the error and
+    // emitted it as a Flight error chunk — surfacing it again here would
+    // duplicate the entry in the dev overlay.
+    if (!(invalidDynamicUsageError as { digest?: unknown }).digest) {
+      return logMessagesAndSendErrorsToBrowser([invalidDynamicUsageError], ctx)
+    }
+    return
   }
 
   if (syncInterruptReason) {
@@ -5692,7 +5745,8 @@ async function spawnStaticShellValidationInDevImpl(
       fallbackRouteParams,
       ctx,
       hmrRefreshHash,
-      validationSamples
+      validationSamples,
+      devRenderDidError
     )
 
     if (instantConfigsResult.length > 0) {
@@ -6011,8 +6065,6 @@ async function validateStagedShell(
       workStore,
       preludeIsEmpty ? PreludeState.Empty : PreludeState.Full,
       dynamicValidation,
-      // TODO(instant-validation): if allowEmptyStaticShell is true (likely due to blocking configs),
-      // we should probably just skip this altogether
       allowEmptyStaticShell
     )
   } catch (thrownValue) {
@@ -6022,8 +6074,6 @@ async function validateStagedShell(
       workStore,
       PreludeState.Errored,
       dynamicValidation,
-      // TODO(instant-validation): if allowEmptyStaticShell is true (likely due to blocking configs),
-      // we should probably just skip this altogether
       allowEmptyStaticShell
     )
 
@@ -6054,7 +6104,8 @@ async function validateInstantConfigs(
   fallbackRouteParams: OpaqueFallbackRouteParams | null,
   ctx: AppRenderContext,
   hmrRefreshHash: string | undefined,
-  validationSamples: ValidationStoreClient['validationSamples'] | null
+  validationSamples: ValidationStoreClient['validationSamples'] | null,
+  devRenderDidError: boolean
 ): Promise<Array<unknown>> {
   const debug =
     process.env.NEXT_PRIVATE_DEBUG_VALIDATION === '1' ? console.log : undefined
@@ -6107,21 +6158,10 @@ async function validateInstantConfigs(
   const { implicitTags, nonce, workStore } = ctx
   const isDebugChannelEnabled = !!ctx.renderOpts.setReactDebugChannel
 
-  /**
-   * Build and validate a combined payload at the given URL depth.
-   *
-   * Returns null if no instant config exists at this depth.
-   * Returns an empty array if validation passed.
-   * Returns a non-empty array of errors if validation failed.
-   *
-   * When the initial validation uses static segments and finds errors,
-   * automatically retries with runtime stages to discriminate between
-   * runtime and dynamic errors, returning the more specific result.
-   */
   async function validateAtDepth(
     depth: number,
     groupDepthForValidation: number
-  ): Promise<Array<unknown> | null> {
+  ): Promise<null | NavigationValidationResult> {
     return validateAtDepthImpl(depth, groupDepthForValidation, null)
   }
 
@@ -6129,7 +6169,7 @@ async function validateInstantConfigs(
     depth: number,
     groupDepthForValidation: number,
     previousBoundaryState: null | ValidationBoundaryTracking
-  ): Promise<null | Array<unknown>> {
+  ): Promise<null | NavigationValidationResult> {
     const extraChunksController = new AbortController()
 
     const boundaryState = createValidationBoundaryTracking()
@@ -6137,8 +6177,8 @@ async function validateInstantConfigs(
     if (previousBoundaryState) {
       // We're doing a followup render to better discriminate error types
       useRuntimeStageForPartialSegments = true
-      for (const id of previousBoundaryState.requiredIds) {
-        boundaryState.requiredIds.add(id)
+      for (const [id, filePath] of previousBoundaryState.requiredIds) {
+        boundaryState.requiredIds.set(id, filePath)
       }
     }
 
@@ -6211,7 +6251,7 @@ async function validateInstantConfigs(
       validationSampleTracking,
     }
 
-    let errors: Array<unknown>
+    let result: NavigationValidationResult
     try {
       const { prelude: unprocessedPrelude } = await runInSequentialTasks(
         () => {
@@ -6307,45 +6347,51 @@ async function validateInstantConfigs(
 
       const { preludeIsEmpty } = await processPreludeOp(unprocessedPrelude)
 
-      errors = getNavigationDisallowedDynamicReasons(
+      result = getNavigationDisallowedDynamicReasons(
         workStore,
         preludeIsEmpty ? PreludeState.Empty : PreludeState.Full,
         instantValidationState,
         validationSampleTracking,
-        boundaryState
+        boundaryState,
+        devRenderDidError
       )
     } catch (thrownValue) {
-      errors = getNavigationDisallowedDynamicReasons(
+      result = getNavigationDisallowedDynamicReasons(
         workStore,
         PreludeState.Errored,
         instantValidationState,
         validationSampleTracking,
-        boundaryState
+        boundaryState,
+        devRenderDidError
       )
     }
 
-    // This prerender did not produce any errors
-    if (errors.length === 0) {
-      return []
+    // If the prerender produced no real errors at this depth — either an
+    // empty array (clean) or a deferred-only result (Error/AggregateError
+    // representing a missing-boundary fallback) — there's nothing to
+    // discriminate. Pass it up so the outer loop can hold any deferred
+    // fallback back until every depth has been tried.
+    if (!Array.isArray(result) || result.length === 0) {
+      return result
     }
 
     if (previousBoundaryState === null && payloadResult.hasAmbiguousErrors) {
       // This is the first validation attempt. we prepared a payload where dynamic holes might be runtime data dependencies
       // or dynamic data dependencies. We do a followup validation using a payload with only Runtime segments to discriminate
-      const dynamicOnlyErrors = await validateAtDepthImpl(
+      const dynamicOnlyResult = await validateAtDepthImpl(
         depth,
         groupDepthForValidation,
         boundaryState
       )
 
-      if (dynamicOnlyErrors !== null && dynamicOnlyErrors.length > 0) {
+      if (Array.isArray(dynamicOnlyResult) && dynamicOnlyResult.length > 0) {
         // The dynamic errors only validation found errors to report so we favor those
-        return dynamicOnlyErrors
+        return dynamicOnlyResult
       }
     }
 
-    // If we didn't return some other errors at this point the only thing to return is this validation's errors
-    return errors
+    // If we didn't return some other errors at this point the only thing to return is this validation's result
+    return result
   }
 
   // Discover validation depth bounds from the LoaderTree. The array
@@ -6353,6 +6399,8 @@ async function validateInstantConfigs(
   // (route group segments) between that URL depth and the next.
   const groupDepthsByUrlDepth = discoverValidationDepths(loaderTree)
   const maxDepth = groupDepthsByUrlDepth.length
+
+  let impairedValidation: null | Error | AggregateError = null
 
   for (let depth = maxDepth - 1; depth >= 0; depth--) {
     const maxGroupDepth = groupDepthsByUrlDepth[depth]
@@ -6369,21 +6417,45 @@ async function validateInstantConfigs(
             : '...')
       )
 
-      const errors = await validateAtDepth(depth, currentGroupDepth)
+      const result = await validateAtDepth(depth, currentGroupDepth)
 
-      if (errors === null) {
+      if (Array.isArray(result)) {
+        const errors: Array<Error> = result
+        // Validation completed at least partially.
+        if (errors.length > 0) {
+          // There were issues with producing an instant UI for this attempted navigation
+          debug?.(
+            `  Depth ${depth}+${currentGroupDepth}: ❌ Failed (${errors.length} errors)`
+          )
+          return errors
+        } else {
+          // There is nothing blocking instant UI for this simluated navigation
+          debug?.(`  Depth ${depth}+${currentGroupDepth}: ✅ Passed`)
+        }
+      } else if (result === null) {
+        // There was no validation to perform at this level
         debug?.(`  No config at depth ${depth}+${currentGroupDepth}, skipping.`)
-        continue
+      } else {
+        // Something prevented this level from fully validating but there
+        // were no detected errors. Always overwrite — prefer the
+        // shallowest deferred fallback. If a high-level layout drops
+        // children, everything below is unreachable; the shallowest
+        // unrendered segment is closest to the actual cause.
+        impairedValidation = result
       }
+    }
+  }
 
-      if (errors.length > 0) {
-        debug?.(
-          `  Depth ${depth}+${currentGroupDepth}: ❌ Failed (${errors.length} errors)`
-        )
-        return errors
-      }
-
-      debug?.(`  Depth ${depth}+${currentGroupDepth}: ✅ Passed`)
+  if (impairedValidation) {
+    debug?.(
+      `⏸ All depths passed without real errors; surfacing deferred missing-boundary fallback`
+    )
+    if (impairedValidation instanceof AggregateError) {
+      // There is at least one potential cause of the validation blocking
+      return impairedValidation.errors
+    } else {
+      // There was no known cause but we report something anyway
+      return [impairedValidation]
     }
   }
 
@@ -7051,7 +7123,8 @@ async function validateInstantConfigInBuildWithSample(
       fallbackRouteParams,
       validationCtx,
       undefined, // hmrRefreshHash,
-      validationSamples
+      validationSamples,
+      false // build has no shared dev render that would surface errors
     )
   })
 }
@@ -7825,17 +7898,13 @@ async function prerenderToStream(
       const { prelude, preludeIsEmpty } =
         await processPreludeOp(unprocessedPrelude)
 
-      // If we've disabled throwing on empty static shell, then we don't need to
-      // track any dynamic access that occurs above the suspense boundary because
-      // we'll do so in the route shell.
-      if (!allowEmptyStaticShell) {
-        throwIfDisallowedDynamic(
-          workStore,
-          preludeIsEmpty ? PreludeState.Empty : PreludeState.Full,
-          dynamicValidation,
-          serverDynamicTracking
-        )
-      }
+      throwIfDisallowedDynamic(
+        workStore,
+        preludeIsEmpty ? PreludeState.Empty : PreludeState.Full,
+        dynamicValidation,
+        serverDynamicTracking,
+        allowEmptyStaticShell
+      )
 
       const getServerInsertedHTML = makeGetServerInsertedHTML({
         polyfills,
